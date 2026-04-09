@@ -3,38 +3,40 @@ from langgraph.graph import StateGraph, START, END, add_messages
 from typing import TypedDict, Annotated
 from langgraph.prebuilt import tools_condition,ToolNode
 from langchain_core.messages import AIMessage,SystemMessage,AnyMessage, HumanMessage
-from mcp_tool_client import tools
+from mcp_tool_client import get_tools
 import os
+from dotenv import load_dotenv  
+load_dotenv()  # Load environment variables from .env file
 import asyncio
+from pydantic import BaseModel
+from fastapi import FastAPI,HTTPException
+app = FastAPI(title="SQL Assistant API")
+from fastapi.middleware.cors import CORSMiddleware
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+# chat request
+class ChatRequest(BaseModel):
+    messages:str
+
+# chat response
+class ChatResponse(BaseModel):
+    reply:str
+    
 # Define state
 class State(TypedDict):
     messages: Annotated[list[AnyMessage], add_messages]
+
+
 # define llm
 llm = ChatOpenAI(api_key=os.getenv("OPENAI_API_KEY"), model="gpt-4o-mini", temperature=0.7)
-# add tools to llm
-llm_with_tools = llm.bind_tools(tools)
-# Node
-def chat_node(state: State):
-    messages = state["messages"]
-    response = llm_with_tools.invoke(messages)
-    return {"messages": response}
 
-# Build graph
-builder = StateGraph(State)
-
-builder.add_node("chat", chat_node)
-builder.add_node('tools',ToolNode(tools))
-builder.add_edge(START, "chat")
-builder.add_conditional_edges(
-    'chat',
-    tools_condition,
-)
-builder.add_edge("tools", 'chat')
-
-
-graph = builder.compile()
-
-#system prompt
+# system prompt 
 SYSTEM_PROMPT = """
 
 You are an expert SQL assistant. Your job is to:
@@ -55,40 +57,46 @@ Rules:
 - Only generate SELECT, INSERT, UPDATE, or DELETE statements.
 - If the request is unclear, ask for clarification.
 """
-
-# Runasync def main():
-memory = None
-async def main():
-    global memory
-    while True:
-        user_input = input("Ask: ")
-        if user_input.lower() in {"quit", "exit"}:
+# define graph and wrap in fastapi endpoint
+@app.post("/chat", response_model=ChatResponse)
+async def chat(request: ChatRequest): 
+    if not request.messages.strip():
+        raise HTTPException(status_code=400, detail="Messages cannot be empty.")
+    # get tool from mcp server
+    tools =  await get_tools()
+    
+    #load tools in llm
+    llm_with_tools = llm.bind_tools(tools)
+    
+    # define nodes
+    def chat_node(state:State):
+        messages = state["messages"]
+        response = llm_with_tools.invoke(messages)
+        return {'messages': response}
+    #initialize graph
+    builder = StateGraph(State)
+    
+    # add nodes
+    builder.add_node("chat",chat_node)
+    builder.add_node('tools',ToolNode(tools))
+    # add edges
+    builder.add_edge(START,'chat')
+    builder.add_conditional_edges('chat',tools_condition)
+    builder.add_edge('tools','chat')
+    
+    #execute graph
+    graph = builder.compile()
+    
+    state = {"messages": [SystemMessage(content = SYSTEM_PROMPT), 
+                          HumanMessage(content=request.messages)]}
+    
+    result_state = await graph.ainvoke(state) 
+    reply= ""
+    for msg in reversed(result_state["messages"]):
+        if (isinstance(msg, AIMessage)
+            and isinstance(msg.content, str)
+            and msg.content.strip()
+        ):
+            reply = msg.content.strip()
             break
-
-        if memory is None:
-            memory = {
-                "messages": [
-                    SystemMessage(content=SYSTEM_PROMPT),
-                    HumanMessage(content=user_input)
-                ]
-            }
-        else:
-            memory["messages"].append(HumanMessage(content=user_input))
-
-        memory = await graph.ainvoke(memory)
-
-        # Find the last AIMessage with non-empty text content
-        # (avoids ToolMessage or AIMessage that only contains a tool_call with no text)
-        result = ""
-        for msg in reversed(memory["messages"]):
-            if (
-                isinstance(msg, AIMessage)
-                and isinstance(msg.content, str)
-                and msg.content.strip()
-            ):
-                result = msg.content.strip()
-                break
-
-        print(f"Assistant: {result if result else '(no text response)'}")
-if __name__ == "__main__":
-    asyncio.run(main())
+    return ChatResponse(reply=reply or 'no response generated')
